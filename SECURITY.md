@@ -66,10 +66,11 @@ Starting from v1.34.0, all release binaries are signed with [cosign](https://doc
 
 ```bash
 cosign verify-blob \
-  --certificate-identity "https://github.com/Gentleman-Programming/gentle-ai/.github/workflows/release.yaml@refs/heads/main" \
+  --certificate-identity-regexp "^https://github.com/Gentleman-Programming/gentle-ai/.github/workflows/release.yaml" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --bundle checksums.txt.bundle \
+  --certificate checksums.txt.pem \
+  --signature checksums.txt.sig \
   checksums.txt
 ```
 
-Download `checksums.txt` and `checksums.txt.bundle` from the GitHub Releases page.
+Download `checksums.txt`, `checksums.txt.pem`, and `checksums.txt.sig` from the GitHub Releases page.
