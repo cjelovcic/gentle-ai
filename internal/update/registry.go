@@ -12,7 +12,7 @@ package update
 var Tools = []ToolInfo{
 	{
 		Name:          "gentle-ai",
-		Owner:         "Gentleman-Programming",
+		Owner:         "cjelovcic",
 		Repo:          "gentle-ai",
 		DetectCmd:     nil, // version comes from build-time ldflags (app.Version)
 		VersionPrefix: "v",
