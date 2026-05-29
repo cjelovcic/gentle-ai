@@ -72,6 +72,8 @@ The goal is not ceremony. The goal is to avoid accidental chaos while preserving
 curl -fsSL https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.sh | bash
 ```
 
+> **Security**: the installer verifies the cosign signature on `checksums.txt` and the SHA256 of each downloaded binary. [cosign](https://docs.sigstore.dev) must be installed before running the script (`brew install cosign` on macOS). Use Homebrew or Scoop for signature-free installs managed by your package manager.
+
 ### Windows
 
 ```powershell
@@ -125,6 +127,29 @@ Use Scoop on Windows. It is the supported install path for keeping Gentle AI upd
 scoop bucket add gentleman https://github.com/Gentleman-Programming/scoop-bucket
 scoop install gentle-ai
 ```
+
+</details>
+
+<details>
+<summary><strong>Manual binary verification</strong> (cosign + SHA256)</summary>
+
+All release binaries are signed via [cosign keyless OIDC](https://docs.sigstore.dev). To verify a release manually, download `checksums.txt`, `checksums.txt.sig`, and `checksums.txt.pem` from the [Releases page](https://github.com/Gentleman-Programming/gentle-ai/releases), then run:
+
+```bash
+# 1. Verify cosign signature on checksums.txt
+cosign verify-blob \
+  --certificate-identity-regexp "^https://github.com/Gentleman-Programming/gentle-ai/.github/workflows/" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate checksums.txt.pem \
+  --signature checksums.txt.sig \
+  checksums.txt
+
+# 2. Verify SHA256 of the downloaded binary archive
+sha256sum --check --ignore-missing checksums.txt
+# macOS: shasum -a 256 --check --ignore-missing checksums.txt
+```
+
+Both checks must pass before using the binary.
 
 </details>
 

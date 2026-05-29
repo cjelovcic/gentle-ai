@@ -32,9 +32,61 @@ var lookPathFn = exec.LookPath
 var resolveAssetURLFn = resolveAssetURL
 var resolveChecksumURLFn = resolveChecksumURL
 
+// cosignLookPathFn checks if cosign is available in PATH. Package-level var for testability.
+var cosignLookPathFn = exec.LookPath
+
+// cosignExecFn executes a cosign command. Package-level var for testability.
+var cosignExecFn = defaultCosignExec
+
+// resolveCosignSigURLFn and resolveCosignPemURLFn build cosign artifact URLs.
+// Package-level vars for testability.
+var resolveCosignSigURLFn = resolveCosignSigURL
+var resolveCosignPemURLFn = resolveCosignPemURL
+
+func defaultCosignExec(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "cosign", args...)
+	cmd.Stdin = nil
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		first := "(no args)"
+		if len(args) > 0 {
+			first = args[0]
+		}
+		return fmt.Errorf("cosign %s: %w (output: %s)", first, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func resolveCosignSigURL(owner, repo, version string) string {
+	return fmt.Sprintf("https://github.com/%s/%s/releases/download/v%s/checksums.txt.sig",
+		owner, repo, version)
+}
+
+func resolveCosignPemURL(owner, repo, version string) string {
+	return fmt.Sprintf("https://github.com/%s/%s/releases/download/v%s/checksums.txt.pem",
+		owner, repo, version)
+}
+
+// verifyCosignSignature verifies the cosign keyless OIDC signature of checksumPath.
+// Fails hard if cosign is not installed or if the signature is invalid.
+func verifyCosignSignature(ctx context.Context, owner, repo, checksumPath, sigPath, pemPath string) error {
+	if _, err := cosignLookPathFn("cosign"); err != nil {
+		return fmt.Errorf("cosign not found in PATH — install from https://docs.sigstore.dev/system_config/installation/")
+	}
+	identityRegexp := fmt.Sprintf("^https://github.com/%s/%s/.github/workflows/", owner, repo)
+	return cosignExecFn(ctx,
+		"verify-blob",
+		"--certificate-identity-regexp", identityRegexp,
+		"--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
+		"--certificate", pemPath,
+		"--signature", sigPath,
+		checksumPath,
+	)
+}
+
 // Download downloads the GitHub release binary for the given tool, verifies its
-// SHA256 checksum against the release's checksums.txt, and replaces the installed
-// binary atomically.
+// cosign signature and SHA256 checksum against the release's checksums.txt, and
+// replaces the installed binary atomically.
 //
 // Checksum verification is mandatory: the install fails if checksums.txt is
 // unavailable, if the archive is not listed, or if the digest does not match.
@@ -59,26 +111,52 @@ func Download(ctx context.Context, r update.UpdateResult, profile system.Platfor
 	archiveName := resolveArchiveName(r.Tool.Repo, r.LatestVersion, profile.OS, runtime.GOARCH)
 	assetURL := resolveAssetURLFn(r.Tool.Owner, r.Tool.Repo, r.LatestVersion, profile.OS, runtime.GOARCH)
 	checksumURL := resolveChecksumURLFn(r.Tool.Owner, r.Tool.Repo, r.LatestVersion)
+	cosignSigURL := resolveCosignSigURLFn(r.Tool.Owner, r.Tool.Repo, r.LatestVersion)
+	cosignPemURL := resolveCosignPemURLFn(r.Tool.Owner, r.Tool.Repo, r.LatestVersion)
 
-	// Download archive to a temp directory so we can verify before extracting.
+	// Download to a temp directory so we can verify before extracting.
 	tmpDir, err := os.MkdirTemp("", "gentle-ai-upgrade-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Step 1: download checksums.txt + cosign artifacts BEFORE the archive.
+	// Verifying the signing chain first means we never fetch the large binary
+	// from an unsigned or tampered release.
+	checksumPath := filepath.Join(tmpDir, "checksums.txt")
+	if _, err := downloadToFile(ctx, checksumURL, checksumPath); err != nil {
+		return fmt.Errorf("checksum verification failed: checksums.txt unavailable: %w", err)
+	}
+
+	sigPath := filepath.Join(tmpDir, "checksums.txt.sig")
+	if _, err := downloadToFile(ctx, cosignSigURL, sigPath); err != nil {
+		return fmt.Errorf("cosign signature file unavailable (checksums.txt.sig): %w", err)
+	}
+
+	pemPath := filepath.Join(tmpDir, "checksums.txt.pem")
+	if _, err := downloadToFile(ctx, cosignPemURL, pemPath); err != nil {
+		return fmt.Errorf("cosign certificate file unavailable (checksums.txt.pem): %w", err)
+	}
+
+	// Step 2: verify cosign signature — fails hard if cosign is not installed.
+	if err := verifyCosignSignature(ctx, r.Tool.Owner, r.Tool.Repo, checksumPath, sigPath, pemPath); err != nil {
+		return fmt.Errorf("cosign verification failed: %w", err)
+	}
+
+	// Step 3: download archive.
 	archivePath := filepath.Join(tmpDir, archiveName)
 	actualDigest, err := downloadToFile(ctx, assetURL, archivePath)
 	if err != nil {
 		return fmt.Errorf("download %s: %w", r.Tool.Name, err)
 	}
 
-	// Verify checksum — fail closed if checksums.txt is unavailable or mismatched.
-	checksumsContent, err := fetchChecksums(ctx, checksumURL)
+	// Step 4: verify SHA256 — fail closed if mismatched or archive not listed.
+	checksumsData, err := os.ReadFile(checksumPath)
 	if err != nil {
-		return fmt.Errorf("checksum verification failed: checksums.txt unavailable: %w", err)
+		return fmt.Errorf("checksum verification failed: read checksums.txt: %w", err)
 	}
-	expectedDigest, err := expectedChecksumFor(checksumsContent, archiveName)
+	expectedDigest, err := expectedChecksumFor(string(checksumsData), archiveName)
 	if err != nil {
 		return fmt.Errorf("checksum verification failed: %w", err)
 	}

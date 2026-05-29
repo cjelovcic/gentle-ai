@@ -60,10 +60,18 @@ ${BOLD}Gentle-AI installer${NC}
 Usage: install.sh [OPTIONS]
 
 Options:
-  --method METHOD   Force install method: brew, go, binary (default: auto-detect)
-  --dir DIR         Custom install directory for binary method
-  --insecure        Skip checksum verification (not recommended)
-  -h, --help        Show this help
+  --method METHOD     Force install method: brew, go, binary (default: auto-detect)
+  --dir DIR           Custom install directory for binary method
+  --insecure          Skip ALL verification (cosign + SHA256) — debugging only
+  --skip-verify       Alias for --insecure
+  -h, --help          Show this help
+
+Security (binary method):
+  cosign is required. Install it before running this script:
+    macOS: brew install cosign
+    Linux: https://github.com/sigstore/cosign/releases
+  SHA256 checksum verification is always performed.
+  Both checks fail hard — use --insecure only for local debugging.
 
 Install methods (auto-detected in priority order):
   1. brew    — Homebrew tap (recommended)
@@ -271,6 +279,39 @@ get_latest_version() {
     success "Latest version: ${LATEST_VERSION}"
 }
 
+# ============================================================================
+# Cosign signature verification
+# ============================================================================
+
+verify_cosign_signature() {
+    local tmpdir="$1"
+
+    if [ "$INSECURE" = "true" ]; then
+        warn "Skipping cosign signature verification (--insecure). Do NOT use in production."
+        return 0
+    fi
+
+    if ! command -v cosign &>/dev/null; then
+        fatal "cosign is required for signature verification but was not found.\n\nInstall cosign before running this script:\n  macOS:  brew install cosign\n  Linux:  https://github.com/sigstore/cosign/releases\n\nThen re-run the installer. Use --insecure only for local debugging (NOT recommended)."
+    fi
+
+    info "Verifying cosign signature on checksums.txt..."
+    if ! cosign verify-blob \
+        --certificate-identity-regexp "^https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/.github/workflows/" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        --certificate "${tmpdir}/checksums.txt.pem" \
+        --signature "${tmpdir}/checksums.txt.sig" \
+        "${tmpdir}/checksums.txt" 2>/dev/null; then
+        fatal "cosign signature verification FAILED for checksums.txt.\nThis may indicate a tampered release. Refusing to install.\nUse --insecure only if you understand the risk."
+    fi
+
+    success "cosign signature verified"
+}
+
+# ============================================================================
+# Install via binary download
+# ============================================================================
+
 install_binary() {
     step "Installing pre-built binary"
 
@@ -278,13 +319,38 @@ install_binary() {
 
     local archive_name
     archive_name="$(get_archive_name "$VERSION_NUMBER")"
-    local download_url="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/${archive_name}"
-    local checksums_url="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/checksums.txt"
+    local base_url="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/${LATEST_VERSION}"
+    local download_url="${base_url}/${archive_name}"
+    local checksums_url="${base_url}/checksums.txt"
+    local checksums_sig_url="${base_url}/checksums.txt.sig"
+    local checksums_pem_url="${base_url}/checksums.txt.pem"
 
     # Create temp directory — clean up on exit
     local tmpdir
     tmpdir="$(mktemp -d)"
     trap '[ -n "${tmpdir:-}" ] && rm -rf "$tmpdir"' EXIT
+
+    # Download checksums + signature files FIRST, then verify before fetching the archive
+    info "Downloading checksums and signature files..."
+    if ! curl -sfL -o "${tmpdir}/checksums.txt" "$checksums_url"; then
+        if [ "$INSECURE" = "true" ]; then
+            warn "Could not download checksums.txt — verification skipped (--insecure)"
+        else
+            fatal "Could not download checksums.txt from:\n  ${checksums_url}\nRefusing to install without integrity verification.\nUse --insecure to skip (not recommended)."
+        fi
+    fi
+
+    if [ "$INSECURE" != "true" ]; then
+        if ! curl -sfL -o "${tmpdir}/checksums.txt.sig" "$checksums_sig_url"; then
+            fatal "Could not download checksums.txt.sig from:\n  ${checksums_sig_url}\nRelease may not be signed yet. Use --insecure to skip (not recommended)."
+        fi
+        if ! curl -sfL -o "${tmpdir}/checksums.txt.pem" "$checksums_pem_url"; then
+            fatal "Could not download checksums.txt.pem from:\n  ${checksums_pem_url}\nRelease may not be signed yet. Use --insecure to skip (not recommended)."
+        fi
+    fi
+
+    # Verify cosign signature on checksums.txt before downloading the archive
+    verify_cosign_signature "$tmpdir"
 
     # Download archive
     info "Downloading ${archive_name}..."
@@ -301,9 +367,9 @@ install_binary() {
 
     success "Downloaded ${archive_name} (${file_size} bytes)"
 
-    # Download and verify checksum — fail closed unless --insecure is set
-    info "Verifying checksum..."
-    if curl -sL -o "${tmpdir}/checksums.txt" "$checksums_url"; then
+    # Verify SHA256 checksum — fail closed unless --insecure is set
+    info "Verifying SHA256 checksum..."
+    if [ -f "${tmpdir}/checksums.txt" ]; then
         local expected_checksum
         expected_checksum="$(grep "${archive_name}" "${tmpdir}/checksums.txt" 2>/dev/null | awk '{print $1}' || true)"
 
@@ -323,21 +389,15 @@ install_binary() {
             fi
 
             if [ "$actual_checksum" != "$expected_checksum" ]; then
-                fatal "Checksum mismatch!\n  Expected: ${expected_checksum}\n  Got:      ${actual_checksum}"
+                fatal "Checksum mismatch!\n  Expected: ${expected_checksum}\n  Got:      ${actual_checksum}\nRefusing to install a binary with an invalid checksum."
             fi
-            success "Checksum verified"
+            success "SHA256 checksum verified"
         else
             if [ "$INSECURE" = "true" ]; then
                 warn "Archive '${archive_name}' not found in checksums.txt — checksum verification skipped (--insecure)"
             else
                 fatal "Archive '${archive_name}' not found in checksums.txt. Refusing to install unverified binary.\nUse --insecure to skip (not recommended)."
             fi
-        fi
-    else
-        if [ "$INSECURE" = "true" ]; then
-            warn "Could not download checksums.txt — checksum verification skipped (--insecure)"
-        else
-            fatal "Could not download checksums.txt from:\n  ${checksums_url}\nRefusing to install without integrity verification.\nUse --insecure to skip (not recommended)."
         fi
     fi
 
@@ -482,7 +542,7 @@ main() {
                 [ $# -lt 2 ] && fatal "--dir requires an argument"
                 INSTALL_DIR="$2"; shift 2
                 ;;
-            --insecure)
+            --insecure|--skip-verify)
                 INSECURE="true"; shift
                 ;;
             -h|--help)

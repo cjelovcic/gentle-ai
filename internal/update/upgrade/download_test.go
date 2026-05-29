@@ -506,10 +506,15 @@ func TestDownload_ChecksumVerification(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if strings.HasSuffix(r.URL.Path, "checksums.txt") {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "checksums.txt.sig"),
+					strings.HasSuffix(r.URL.Path, "checksums.txt.pem"):
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, "fakecosigndata")
+				case strings.HasSuffix(r.URL.Path, "checksums.txt"):
 					w.WriteHeader(tc.checksumsStatus)
 					fmt.Fprint(w, tc.checksumsBody)
-				} else {
+				default:
 					w.WriteHeader(http.StatusOK)
 					w.Write(tarContent) //nolint:errcheck
 				}
@@ -524,9 +529,13 @@ func TestDownload_ChecksumVerification(t *testing.T) {
 			// Mock URL builders to redirect to the test server.
 			origAssetURLFn := resolveAssetURLFn
 			origChecksumURLFn := resolveChecksumURLFn
+			origCosignSigURLFn := resolveCosignSigURLFn
+			origCosignPemURLFn := resolveCosignPemURLFn
 			t.Cleanup(func() {
 				resolveAssetURLFn = origAssetURLFn
 				resolveChecksumURLFn = origChecksumURLFn
+				resolveCosignSigURLFn = origCosignSigURLFn
+				resolveCosignPemURLFn = origCosignPemURLFn
 			})
 			resolveAssetURLFn = func(owner, repo, version, goos, goarch string) string {
 				return server.URL + "/" + archiveName
@@ -534,6 +543,22 @@ func TestDownload_ChecksumVerification(t *testing.T) {
 			resolveChecksumURLFn = func(owner, repo, version string) string {
 				return server.URL + "/checksums.txt"
 			}
+			resolveCosignSigURLFn = func(owner, repo, version string) string {
+				return server.URL + "/checksums.txt.sig"
+			}
+			resolveCosignPemURLFn = func(owner, repo, version string) string {
+				return server.URL + "/checksums.txt.pem"
+			}
+
+			// Mock cosign to succeed so these tests focus on SHA256 behavior only.
+			origCosignLookPath := cosignLookPathFn
+			origCosignExec := cosignExecFn
+			t.Cleanup(func() {
+				cosignLookPathFn = origCosignLookPath
+				cosignExecFn = origCosignExec
+			})
+			cosignLookPathFn = func(name string) (string, error) { return "/usr/bin/cosign", nil }
+			cosignExecFn = func(ctx context.Context, args ...string) error { return nil }
 
 			// Mock lookPathFn with a real temp binary (atomicReplace needs a valid path).
 			tmpBinary := filepath.Join(t.TempDir(), binaryName)
@@ -542,6 +567,152 @@ func TestDownload_ChecksumVerification(t *testing.T) {
 			}
 			origLookPath := lookPathFn
 			t.Cleanup(func() { lookPathFn = origLookPath })
+			lookPathFn = func(name string) (string, error) { return tmpBinary, nil }
+
+			r := update.UpdateResult{
+				Tool: update.ToolInfo{
+					Name:  binaryName,
+					Owner: "test-owner",
+					Repo:  binaryName,
+				},
+				LatestVersion: "1.0.0",
+			}
+			profile := system.PlatformProfile{OS: runtime.GOOS}
+
+			err := Download(context.Background(), r, profile)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("Download() error = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if tc.errContains != "" && err != nil && !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("Download() error = %q, want it to contain %q", err.Error(), tc.errContains)
+			}
+		})
+	}
+}
+
+// --- TestDownload_CosignVerification ---
+
+// TestDownload_CosignVerification covers the 4 cosign-specific scenarios:
+// 1. cosign not installed → abort
+// 2. cosign signature invalid → abort
+// 3. checksums.txt.sig not available → abort (handled by download failure)
+// 4. happy path (valid sig + correct checksum) → succeeds (covered by TestDownload_ChecksumVerification "matching checksum succeeds")
+func TestDownload_CosignVerification(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("binary download not supported on Windows")
+	}
+
+	binaryName := "fake-tool"
+	tarPath := makeFakeTarGz(t, binaryName)
+	tarContent, err := os.ReadFile(tarPath)
+	if err != nil {
+		t.Fatalf("read fake tar.gz: %v", err)
+	}
+
+	h := sha256.New()
+	h.Write(tarContent)
+	realDigest := hex.EncodeToString(h.Sum(nil))
+	archiveName := resolveArchiveName(binaryName, "1.0.0", runtime.GOOS, runtime.GOARCH)
+	validChecksums := fmt.Sprintf("%s  %s\n", realDigest, archiveName)
+
+	tests := []struct {
+		name            string
+		cosignLookPath  func(string) (string, error)
+		cosignExec      func(context.Context, ...string) error
+		sigStatus       int
+		wantErr         bool
+		errContains     string
+	}{
+		{
+			name:        "cosign not installed",
+			cosignLookPath: func(string) (string, error) {
+				return "", fmt.Errorf("not found")
+			},
+			cosignExec:  func(context.Context, ...string) error { return nil },
+			sigStatus:   http.StatusOK,
+			wantErr:     true,
+			errContains: "cosign not found",
+		},
+		{
+			name:        "cosign signature invalid",
+			cosignLookPath: func(string) (string, error) { return "/usr/bin/cosign", nil },
+			cosignExec: func(context.Context, ...string) error {
+				return fmt.Errorf("FAILED: signature verification failed")
+			},
+			sigStatus:   http.StatusOK,
+			wantErr:     true,
+			errContains: "cosign verification failed",
+		},
+		{
+			name:        "cosign sig file unavailable",
+			cosignLookPath: func(string) (string, error) { return "/usr/bin/cosign", nil },
+			cosignExec:  func(context.Context, ...string) error { return nil },
+			sigStatus:   http.StatusNotFound,
+			wantErr:     true,
+			errContains: "checksums.txt.sig",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "checksums.txt.sig"):
+					w.WriteHeader(tc.sigStatus)
+					fmt.Fprint(w, "fakesig")
+				case strings.HasSuffix(r.URL.Path, "checksums.txt.pem"):
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, "fakepem")
+				case strings.HasSuffix(r.URL.Path, "checksums.txt"):
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, validChecksums)
+				default:
+					w.WriteHeader(http.StatusOK)
+					w.Write(tarContent) //nolint:errcheck
+				}
+			}))
+			defer server.Close()
+
+			origClient := httpClient
+			t.Cleanup(func() { httpClient = origClient })
+			httpClient = server.Client()
+
+			origAssetURLFn := resolveAssetURLFn
+			origChecksumURLFn := resolveChecksumURLFn
+			origCosignSigURLFn := resolveCosignSigURLFn
+			origCosignPemURLFn := resolveCosignPemURLFn
+			origCosignLookPath := cosignLookPathFn
+			origCosignExec := cosignExecFn
+			origLookPath := lookPathFn
+			t.Cleanup(func() {
+				resolveAssetURLFn = origAssetURLFn
+				resolveChecksumURLFn = origChecksumURLFn
+				resolveCosignSigURLFn = origCosignSigURLFn
+				resolveCosignPemURLFn = origCosignPemURLFn
+				cosignLookPathFn = origCosignLookPath
+				cosignExecFn = origCosignExec
+				lookPathFn = origLookPath
+			})
+
+			resolveAssetURLFn = func(owner, repo, version, goos, goarch string) string {
+				return server.URL + "/" + archiveName
+			}
+			resolveChecksumURLFn = func(owner, repo, version string) string {
+				return server.URL + "/checksums.txt"
+			}
+			resolveCosignSigURLFn = func(owner, repo, version string) string {
+				return server.URL + "/checksums.txt.sig"
+			}
+			resolveCosignPemURLFn = func(owner, repo, version string) string {
+				return server.URL + "/checksums.txt.pem"
+			}
+			cosignLookPathFn = tc.cosignLookPath
+			cosignExecFn = tc.cosignExec
+
+			tmpBinary := filepath.Join(t.TempDir(), binaryName)
+			if err := os.WriteFile(tmpBinary, []byte("old binary"), 0o755); err != nil {
+				t.Fatalf("write temp binary: %v", err)
+			}
 			lookPathFn = func(name string) (string, error) { return tmpBinary, nil }
 
 			r := update.UpdateResult{
